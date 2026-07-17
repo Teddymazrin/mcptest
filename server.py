@@ -2,6 +2,7 @@ import os
 import secrets
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
@@ -17,6 +18,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 DOCS_DIR = Path(__file__).parent / "docs"
@@ -105,6 +107,12 @@ class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
 
 provider = SingleUserOAuthProvider()
 
+# The public hostname this server is reached at, e.g. "myapp.onrender.com".
+# The MCP SDK's DNS-rebinding protection rejects any Host header not listed
+# here, so the deployed host must be allowed explicitly or every /mcp request
+# gets a 421 Misdirected Request.
+_public_host = urlparse(BASE_URL).netloc
+
 mcp = FastMCP(
     "MyPrivateDocs",
     auth_server_provider=provider,
@@ -112,6 +120,14 @@ mcp = FastMCP(
         issuer_url=AnyHttpUrl(BASE_URL),
         resource_server_url=AnyHttpUrl(f"{BASE_URL}/mcp"),
         client_registration_options=ClientRegistrationOptions(enabled=True),
+    ),
+    # Stateless avoids in-memory session-continuity requirements, which are
+    # fragile behind a reverse proxy and on hosts that spin the process down.
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[_public_host, f"{_public_host}:*", "127.0.0.1:*", "localhost:*"],
+        allowed_origins=[BASE_URL, f"{BASE_URL}:*", "http://127.0.0.1:*", "http://localhost:*"],
     ),
 )
 
