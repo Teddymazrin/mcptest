@@ -1,19 +1,119 @@
 import os
+import secrets
+import time
 from pathlib import Path
 
+from pydantic import AnyHttpUrl
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
+
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 DOCS_DIR = Path(__file__).parent / "docs"
-API_KEY = os.environ.get("MCP_API_KEY", "changeme")
 
-mcp = FastMCP("MyPrivateDocs")
+# The public HTTPS URL of this deployed service, e.g. https://your-app.onrender.com
+BASE_URL = os.environ["BASE_URL"].rstrip("/")
+# The one passphrase that gates the /login page. Only whoever knows this can
+# ever complete the OAuth flow and get a working access token.
+PASSPHRASE = os.environ.get("MCP_PASSPHRASE", "changeme")
+
+CODE_TTL_SECONDS = 300
+TOKEN_TTL_SECONDS = 3600
 
 
 def _list_docs() -> dict:
     return {p.stem: p.name for p in sorted(DOCS_DIR.glob("*.md"))}
+
+
+class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
+    """Minimal OAuth authorization server for exactly one user (you).
+
+    Dynamic Client Registration is open (any MCP client can register itself,
+    that's just how the client app identifies itself). The actual gate is the
+    /login passphrase step: nobody gets an authorization code, and therefore
+    nobody gets an access token, without typing PASSPHRASE correctly.
+    """
+
+    def __init__(self):
+        self.clients: dict[str, OAuthClientInformationFull] = {}
+        self.pending: dict[str, dict] = {}  # login_id -> {client_id, params}
+        self.auth_codes: dict[str, AuthorizationCode] = {}
+        self.access_tokens: dict[str, AccessToken] = {}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self.clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self.clients[client_info.client_id] = client_info
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        login_id = secrets.token_urlsafe(16)
+        self.pending[login_id] = {"client_id": client.client_id, "params": params}
+        return f"{BASE_URL}/login?login_id={login_id}"
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        code = self.auth_codes.get(authorization_code)
+        if code is None or code.client_id != client.client_id or code.expires_at < time.time():
+            return None
+        return code
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        token = secrets.token_urlsafe(32)
+        self.access_tokens[token] = AccessToken(
+            token=token,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + TOKEN_TTL_SECONDS,
+        )
+        self.auth_codes.pop(authorization_code.code, None)
+        return OAuthToken(
+            access_token=token,
+            token_type="bearer",
+            expires_in=TOKEN_TTL_SECONDS,
+            scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
+        )
+
+    async def load_refresh_token(self, client, refresh_token: str):
+        return None  # not supported; client must re-authorize
+
+    async def exchange_refresh_token(self, client, refresh_token, scopes):
+        raise TokenError(error="unsupported_grant_type", error_description="Refresh tokens are not supported")
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        at = self.access_tokens.get(token)
+        if at is None or (at.expires_at and at.expires_at < time.time()):
+            return None
+        return at
+
+    async def revoke_token(self, token) -> None:
+        self.access_tokens.pop(token.token, None)
+
+
+provider = SingleUserOAuthProvider()
+
+mcp = FastMCP(
+    "MyPrivateDocs",
+    auth_server_provider=provider,
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(BASE_URL),
+        resource_server_url=AnyHttpUrl(f"{BASE_URL}/mcp"),
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    ),
+)
 
 
 @mcp.tool()
@@ -52,19 +152,61 @@ def search_docs(query: str) -> dict:
     return results or {"message": "No matches found."}
 
 
-class ApiKeyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        # Accept the key either as a header (for clients that support it)
-        # or as a ?key= query param (for the Claude.ai connector URL field).
-        supplied = request.headers.get("x-api-key") or request.query_params.get("key")
-        if supplied != API_KEY:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
+LOGIN_FORM = """<!doctype html>
+<html><body style="font-family: sans-serif; max-width: 400px; margin: 80px auto;">
+<h2>Sign in to MyPrivateDocs</h2>
+{error}
+<form method="post">
+<input type="hidden" name="login_id" value="{login_id}">
+<label>Passphrase<br>
+<input type="password" name="passphrase" autofocus style="width: 100%; padding: 8px;">
+</label><br><br>
+<button type="submit" style="padding: 8px 16px;">Continue</button>
+</form>
+</body></html>"""
 
 
-# FastMCP's ASGI app for streamable HTTP, wrapped with our auth check
+@mcp.custom_route("/login", methods=["GET", "POST"])
+async def login(request: Request) -> Response:
+    if request.method == "GET":
+        login_id = request.query_params.get("login_id", "")
+        if login_id not in provider.pending:
+            return HTMLResponse("Invalid or expired login link.", status_code=400)
+        return HTMLResponse(LOGIN_FORM.format(error="", login_id=login_id))
+
+    form = await request.form()
+    login_id = str(form.get("login_id", ""))
+    passphrase = str(form.get("passphrase", ""))
+    pending = provider.pending.get(login_id)
+    if pending is None:
+        return HTMLResponse("Invalid or expired login link.", status_code=400)
+
+    if passphrase != PASSPHRASE:
+        return HTMLResponse(
+            LOGIN_FORM.format(error="<p style='color:red'>Incorrect passphrase.</p>", login_id=login_id),
+            status_code=401,
+        )
+
+    provider.pending.pop(login_id, None)
+    client_id = pending["client_id"]
+    params: AuthorizationParams = pending["params"]
+
+    code = secrets.token_urlsafe(24)
+    provider.auth_codes[code] = AuthorizationCode(
+        code=code,
+        scopes=params.scopes or [],
+        expires_at=time.time() + CODE_TTL_SECONDS,
+        client_id=client_id,
+        code_challenge=params.code_challenge,
+        redirect_uri=params.redirect_uri,
+        redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+        resource=params.resource,
+    )
+    redirect_url = construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
 app = mcp.streamable_http_app()
-app.add_middleware(ApiKeyMiddleware)
 
 if __name__ == "__main__":
     import uvicorn
