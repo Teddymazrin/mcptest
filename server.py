@@ -54,7 +54,10 @@ def search_docs(query: str) -> dict:
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        if request.headers.get("x-api-key") != API_KEY:
+        # Accept the key either as a header (for clients that support it)
+        # or as a ?key= query param (for the Claude.ai connector URL field).
+        supplied = request.headers.get("x-api-key") or request.query_params.get("key")
+        if supplied != API_KEY:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
